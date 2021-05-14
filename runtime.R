@@ -13,6 +13,20 @@ prettify_list <- function(x) {
   )
 }
 
+# error handling with http codes
+# from http://adv-r.had.co.nz/Exceptions-Debugging.html
+condition <- function(subclass, message, code, call = sys.call(-1), ...) {
+  structure(
+    class = c(subclass, "condition"),
+    list(message = message, code = code, call = call),
+    ...
+  )
+}
+stop_api <- function(message, code = 500, call = sys.call(-1), ...) {
+  stop(condition(c("api_error", "error"), message, code = code, call = call,
+    ...))
+}
+
 log_debug("Deriving lambda runtime API endpoints from environment variables")
 lambda_runtime_api <- Sys.getenv("AWS_LAMBDA_RUNTIME_API")
 if (lambda_runtime_api == "") {
@@ -32,7 +46,7 @@ tryCatch(
     log_debug("Determining handler from environment variables")
     handler <- Sys.getenv("_HANDLER")
     if (is.null(handler) || handler == "") {
-      stop("_HANDLER environment variable undefined")
+      stop_api("_HANDLER environment variable undefined")
     }
     log_info("Handler found:", handler)
     handler_split <- strsplit(handler, ".", fixed = TRUE)[[1]]
@@ -42,24 +56,26 @@ tryCatch(
 
     log_debug("Checking if", file_name, "exists")
     if (!file.exists(file_name)) {
-      stop(file_name, " doesn't exist in ", getwd())
+      stop_api(file_name, " doesn't exist in ", getwd())
     }
     source(file_name)
 
     log_debug("Checking if", function_name, "is defined")
     if (!exists(function_name)) {
-      stop("Function name ", function_name, " isn't defined in R")
+      stop_api("Function name ", function_name, " isn't defined in R")
     }
     log_debug("Checking if", function_name, "is a function")
     if (!is.function(eval(parse(text = function_name)))) {
-      stop("Function name ", function_name, " is not a function")
+      stop_api("Function name ", function_name, " is not a function")
     }
   },
-  error = function(e) {
+  api_error = function(e) {
     log_error(as.character(e))
     POST(
       url = initialisation_error_endpoint,
-      body = list(error_message = as.character(e)),
+      body = list(
+        statusCode = e$code,
+        error_message = as.character(e$message)),
       encode = "json"
     )
     stop(e)
@@ -70,7 +86,8 @@ handle_event <- function(event) {
   status_code <- status_code(event)
   log_debug("Status code:", status_code)
   if (status_code != 200) {
-    stop("Didn't get status code 200. Status code: ", status_code)
+    stop_api("Didn't get status code 200. Status code: ", status_code,
+      code = 400)
   }
   event_headers <- headers(event)
 
@@ -80,7 +97,8 @@ handle_event <- function(event) {
 
   aws_request_id <- event_headers[["lambda-runtime-aws-request-id"]]
   if (is.null(aws_request_id)) {
-    stop("Could not find lambda-runtime-aws-request-id header in event")
+    stop_api("Could not find lambda-runtime-aws-request-id header in event",
+      code = 400)
   }
 
   # According to the AWS guide, the below is used by "X-Ray SDK"
@@ -100,7 +118,7 @@ handle_event <- function(event) {
   unparsed_content <- httr::content(event, "text", encoding = "UTF-8")
   # Thank you to Menno Schellekens for this fix for Cloudwatch events
   is_scheduled_event <- grepl("Scheduled Event", unparsed_content)
-  if(is_scheduled_event) log_info("Event type is scheduled") 
+  if(is_scheduled_event) log_info("Event type is scheduled")
   log_debug("Unparsed content:", unparsed_content)
   if (unparsed_content == "" || is_scheduled_event) {
     # (1a) direct invocation with no args (or scheduled request)
@@ -142,7 +160,7 @@ handle_event <- function(event) {
     list(
       isBase64Encoded = FALSE,
       statusCode = 200L,
-      body = result
+      body =  as.character(jsonlite::toJSON(result))
       )
   } else {
     result
@@ -163,9 +181,34 @@ while (TRUE) {
       log_debug("Event received")
       handle_event(event)
     },
+     api_error = function(e) {
+      log_error(as.character(e))
+      aws_request_id <-
+        headers(event)[["lambda-runtime-aws-request-id"]]
+      if (exists("aws_request_id")) {
+        log_debug("POSTing invocation error for ID:", aws_request_id)
+        invocation_error_endpoint <- paste0(
+          "http://", lambda_runtime_api, "/2018-06-01/runtime/invocation/",
+          aws_request_id, "/error"
+        )
+        POST(
+          url = invocation_error_endpoint,
+          body = list(
+            statusCode = e$code,
+            error_message = as.character(e$message)),
+          encode = "json"
+        )
+      } else {
+        log_debug("No invocation ID!",
+          "Can't clear this request from the queue.")
+      }
+    },
     error = function(e) {
       log_error(as.character(e))
+      aws_request_id <-
+        headers(event)[["lambda-runtime-aws-request-id"]]
       if (exists("aws_request_id")) {
+        log_debug("POSTing invocation error for ID:", aws_request_id)
         invocation_error_endpoint <- paste0(
           "http://", lambda_runtime_api, "/2018-06-01/runtime/invocation/",
           aws_request_id, "/error"
@@ -175,8 +218,10 @@ while (TRUE) {
           body = list(error_message = as.character(e)),
           encode = "json"
         )
+      } else {
+        log_debug("No invocation ID!",
+          "Can't clear this request from the queue.")
       }
-      stop(e)
     }
   )
 }
